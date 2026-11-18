@@ -109,15 +109,43 @@ Rust 1.98 or newer, edition 2024; the toolchain is pinned in
 5. **Later.** Line-of-sight queries; heights and overlapping surfaces; reusable
    search memory; provably shortest routes; tiles, streaming and
    serialisation; jump and point-to-point links; generation from arbitrary 3D
-   geometry; flying and swimming volumes; debug tooling; CI.
+   geometry; flying and swimming volumes; debug tooling.
 
-## Development
+## Tests
 
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+CI runs all three on every pull request, with the tests on Linux, macOS and
+Windows.
+
+The suite lives in `tests/suite/`, one module per flow:
+
+| Module | What it covers |
+|---|---|
+| `build` | Both ways of building a mesh, and every way they refuse bad input |
+| `lookup` | `locate`, `nearest` and `contains` |
+| `paths` | Routes with known answers, on hand-made meshes and maps drawn as text |
+| `random` | Random maps, checked against independent searches |
+| `determinism` | A recorded fingerprint of routes, which must match on every platform |
+
+To cover something new, add a test to the module it belongs to. A scenario is
+usually a small map drawn as text:
+
+```rust
+let map = Map::drawn(&[
+    "S.#..",
+    "..#..",
+    "....G",
+]);
+assert_eq!(route(&map).points, [map.at('S'), map.corner(2, 1), map.at('G')]);
+```
+
+If a change alters any route, the fingerprint test fails and prints the new
+value. Update it only when the change is meant.
 
 ## License
 
