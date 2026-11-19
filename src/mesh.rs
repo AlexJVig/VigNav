@@ -7,7 +7,8 @@
 use std::fmt;
 use std::ops::{Range, RangeInclusive};
 
-use crate::geom::{Coord, Point, closest_on_segment, cross, dist_sq};
+use crate::geom::{Coord, Point, cross, dist_sq};
+use crate::live::Live;
 
 /// How far, in millimetres, a corner may dent inwards and still count as
 /// convex.
@@ -155,6 +156,10 @@ impl std::error::Error for MeshError {}
 /// Polygons are wound counter-clockwise. Edge `i` of a polygon runs from its
 /// corner `i` to its corner `i + 1`, wrapping at the end. An edge either lies
 /// on the outside of the mesh or links to exactly one polygon across it.
+///
+/// The polygons never change once the mesh is built. Obstacles are laid over
+/// them (see [`NavMesh::add_obstacle`]); lookups and path queries see the
+/// ground the obstacles leave.
 #[derive(Clone, Debug)]
 pub struct NavMesh {
     vertices: Vec<Point>,
@@ -162,13 +167,18 @@ pub struct NavMesh {
     edge_origin: Vec<u32>,
     /// Polygon across each edge, or `NONE` on the outside of the mesh.
     edge_neighbor: Vec<u32>,
+    /// The same edge as the polygon across it holds it, or `NONE`.
+    edge_twin: Vec<u32>,
     /// Polygon each edge belongs to.
     edge_poly: Vec<u32>,
     /// First edge of each polygon, then one past the last edge of all.
     first_edge: Vec<u32>,
-    /// Connected group each polygon belongs to.
+    /// Connected group each polygon belongs to, ignoring obstacles.
     island: Vec<u32>,
-    grid: Grid,
+    /// Bounding box of each polygon.
+    boxes: Vec<(Point, Point)>,
+    pub(crate) grid: Grid,
+    pub(crate) live: Live,
 }
 
 impl NavMesh {
@@ -228,15 +238,18 @@ impl NavMesh {
             .map(|edge| self.neighbor_across(edge).map(|other| PolyId(other as u32)))
     }
 
-    /// The connected group a polygon belongs to. A path exists between two
-    /// polygons exactly when they are in the same group.
+    /// The connected group a polygon belongs to in the mesh as built. With no
+    /// obstacles, a path exists between two polygons exactly when they are in
+    /// the same group. Obstacles are not taken into account.
     ///
     /// Panics if `poly` is not a polygon of this mesh.
     pub fn island(&self, poly: PolyId) -> u32 {
         self.island[poly.index()]
     }
 
-    /// Whether `p` is inside a polygon or on its boundary.
+    /// Whether `p` is inside a polygon or on its boundary. Obstacles are not
+    /// taken into account; [`locate`](NavMesh::locate) is the test for
+    /// ground a unit can stand on.
     ///
     /// Panics if `poly` is not a polygon of this mesh.
     pub fn contains(&self, poly: PolyId, p: Point) -> bool {
@@ -247,15 +260,32 @@ impl NavMesh {
             })
     }
 
-    /// The polygon containing `p`. On a shared edge, and where polygons
-    /// overlap, this is the one with the lowest id.
+    /// The polygon whose ground `p` is on. On a shared edge, and where
+    /// polygons overlap, this is the one with the lowest id; see
+    /// [`locate_all`](NavMesh::locate_all). A point inside a blocking
+    /// obstacle is on no polygon.
     pub fn locate(&self, p: Point) -> Option<PolyId> {
-        let cell = self.grid.cell_at(p)?;
+        self.piece_at(p).map(|(polygon, _)| PolyId(polygon))
+    }
+
+    /// Every polygon whose ground `p` is on, in ascending order. There is
+    /// more than one on a shared edge and wherever one surface passes over
+    /// another, such as a bridge over a road.
+    pub fn locate_all(&self, p: Point) -> Vec<PolyId> {
+        let Some(cell) = self.grid.cell_at(p) else {
+            return Vec::new();
+        };
+        let on = |&&polygon: &&u32| {
+            self.live.pieces[polygon as usize]
+                .iter()
+                .any(|piece| piece.contains(p))
+        };
         self.grid
             .polygons_in(cell)
             .iter()
+            .filter(on)
             .map(|&polygon| PolyId(polygon))
-            .find(|&poly| self.contains(poly, p))
+            .collect()
     }
 
     /// The point of the mesh nearest to `p`, if one lies within `max_dist`
@@ -264,30 +294,11 @@ impl NavMesh {
         if let Some(poly) = self.locate(p) {
             return Some(Location { poly, point: p });
         }
-        if !p.in_range() || max_dist < 0 || self.polygon_count() == 0 {
-            return None;
-        }
-        let reach = i64::from(max_dist);
-        let (x, y) = (i64::from(p.x), i64::from(p.y));
-        let (cols, rows) = self
-            .grid
-            .span((x - reach, y - reach), (x + reach, y + reach));
-        let mut best: Option<(i64, u32, Point)> = None;
-        for row in rows {
-            for col in cols.clone() {
-                for &polygon in self.grid.polygons_in((row * self.grid.cols + col) as usize) {
-                    let point = self.closest_on_boundary(polygon as usize, p);
-                    let found = (dist_sq(p, point), polygon, point);
-                    if found.0 <= reach * reach && best.is_none_or(|best| found < best) {
-                        best = Some(found);
-                    }
-                }
-            }
-        }
-        best.map(|(_, polygon, point)| Location {
-            poly: PolyId(polygon),
-            point,
-        })
+        self.nearest_piece(p, max_dist, |_| true)
+            .map(|((polygon, _), point)| Location {
+                poly: PolyId(polygon),
+                point,
+            })
     }
 
     /// The edges of a polygon, as indices into the edge arrays.
@@ -320,27 +331,15 @@ impl NavMesh {
         self.edge_poly[edge] as usize
     }
 
-    /// The whole stretch of boundary shared with the polygon across `edge`,
-    /// from its start to its end as the owning polygon winds.
-    ///
-    /// Two convex polygons meet along one straight segment, but that segment
-    /// may be split into several edges by corners lying on it. A route may
-    /// cross anywhere along the segment, not only through the one edge.
-    pub(crate) fn portal(&self, edge: usize) -> (Point, Point) {
-        let range = self.edges_of(self.owner_of(edge));
-        let across = self.edge_neighbor[edge];
-        let around = |edge: usize, by: usize| range.start + (edge - range.start + by) % range.len();
-        let (mut first, mut last, mut spanned) = (edge, edge, 1);
-        while spanned < range.len() && self.edge_neighbor[around(first, range.len() - 1)] == across
-        {
-            first = around(first, range.len() - 1);
-            spanned += 1;
-        }
-        while spanned < range.len() && self.edge_neighbor[around(last, 1)] == across {
-            last = around(last, 1);
-            spanned += 1;
-        }
-        (self.edge_points(first).0, self.edge_points(last).1)
+    /// The same edge as held by the polygon across it.
+    pub(crate) fn twin_of(&self, edge: usize) -> Option<usize> {
+        let twin = self.edge_twin[edge];
+        (twin != NONE).then_some(twin as usize)
+    }
+
+    /// The bounding box of a polygon.
+    pub(crate) fn box_of(&self, polygon: usize) -> (Point, Point) {
+        self.boxes[polygon]
     }
 
     /// Checks every polygon and stores its edges, with no links yet.
@@ -357,10 +356,13 @@ impl NavMesh {
             vertices: vertices.to_vec(),
             edge_origin: Vec::with_capacity(edge_total),
             edge_neighbor: vec![NONE; edge_total],
+            edge_twin: vec![NONE; edge_total],
             edge_poly: Vec::with_capacity(edge_total),
             first_edge: Vec::with_capacity(polygons.len() + 1),
             island: Vec::new(),
+            boxes: Vec::new(),
             grid: Grid::default(),
+            live: Live::default(),
         };
         for (polygon, corners) in polygons.iter().enumerate() {
             let corners = corners.as_ref();
@@ -394,6 +396,8 @@ impl NavMesh {
                 {
                     self.edge_neighbor[e] = self.edge_poly[f];
                     self.edge_neighbor[f] = self.edge_poly[e];
+                    self.edge_twin[e] = f as u32;
+                    self.edge_twin[f] = e as u32;
                 }
                 _ => {
                     let edge = group[0].2;
@@ -433,18 +437,20 @@ impl NavMesh {
             };
             let (a, b) = self.edge_points(edge);
             let polygon = self.owner_of(edge);
-            let answered = self.edges_of(other).any(|back| {
+            let answer = self.edges_of(other).find(|&back| {
                 self.neighbor_across(back) == Some(polygon) && self.edge_points(back) == (b, a)
             });
-            if !answered {
+            let Some(back) = answer else {
                 let edge = edge - self.edges_of(polygon).start;
                 return Err(MeshError::BadLink { polygon, edge });
-            }
+            };
+            self.edge_twin[edge] = back as u32;
         }
         Ok(())
     }
 
-    /// Derives the islands and the lookup grid once the links are in place.
+    /// Derives the islands, the lookup grid and the live ground once the
+    /// links are in place.
     fn finished(mut self) -> Self {
         let count = self.polygon_count();
         self.island = vec![NONE; count];
@@ -468,8 +474,9 @@ impl NavMesh {
             }
             islands += 1;
         }
-        let boxes: Vec<(Point, Point)> = (0..count).map(|p| self.bounding_box(p)).collect();
-        self.grid = Grid::new(&boxes);
+        self.boxes = (0..count).map(|p| self.bounding_box(p)).collect();
+        self.grid = Grid::new(&self.boxes);
+        self.start_live();
         self
     }
 
@@ -483,20 +490,14 @@ impl NavMesh {
                 )
             })
     }
-
-    fn closest_on_boundary(&self, polygon: usize, p: Point) -> Point {
-        self.edges_of(polygon)
-            .map(|edge| {
-                let (a, b) = self.edge_points(edge);
-                closest_on_segment(p, a, b)
-            })
-            .min_by_key(|&q| dist_sq(p, q))
-            .expect("a polygon has at least three edges")
-    }
 }
 
 /// Checks one polygon's corner list against the rules in [`MeshError`].
-fn check_polygon(vertices: &[Point], polygon: usize, corners: &[u32]) -> Result<(), MeshError> {
+pub(crate) fn check_polygon(
+    vertices: &[Point],
+    polygon: usize,
+    corners: &[u32],
+) -> Result<(), MeshError> {
     let n = corners.len();
     if n < 3 {
         return Err(MeshError::TooFewCorners { polygon });
@@ -544,13 +545,13 @@ fn turns_left_within_slack(a: Point, b: Point, c: Point) -> bool {
 /// A uniform grid over the mesh. Each cell lists the polygons whose bounding
 /// box touches it, in ascending order.
 #[derive(Clone, Debug, Default)]
-struct Grid {
+pub(crate) struct Grid {
     min: Point,
     max: Point,
     /// Side of a cell, in millimetres.
-    cell: i64,
-    cols: i64,
-    rows: i64,
+    pub(crate) cell: i64,
+    pub(crate) cols: i64,
+    pub(crate) rows: i64,
     /// Where each cell's polygons start in `items`, plus the total at the end.
     starts: Vec<usize>,
     items: Vec<u32>,
@@ -618,14 +619,18 @@ impl Grid {
 
     /// The columns and rows touched by the box `lo`..=`hi`, clamped to the
     /// grid. The grid must not be empty.
-    fn span(&self, lo: (i64, i64), hi: (i64, i64)) -> (RangeInclusive<i64>, RangeInclusive<i64>) {
+    pub(crate) fn span(
+        &self,
+        lo: (i64, i64),
+        hi: (i64, i64),
+    ) -> (RangeInclusive<i64>, RangeInclusive<i64>) {
         let col = |x: i64| ((x - i64::from(self.min.x)) / self.cell).clamp(0, self.cols - 1);
         let row = |y: i64| ((y - i64::from(self.min.y)) / self.cell).clamp(0, self.rows - 1);
         (col(lo.0)..=col(hi.0), row(lo.1)..=row(hi.1))
     }
 
     /// The cell holding `p`, if `p` is within the grid.
-    fn cell_at(&self, p: Point) -> Option<usize> {
+    pub(crate) fn cell_at(&self, p: Point) -> Option<usize> {
         let inside = self.cols > 0
             && (self.min.x..=self.max.x).contains(&p.x)
             && (self.min.y..=self.max.y).contains(&p.y);
@@ -636,7 +641,7 @@ impl Grid {
         })
     }
 
-    fn polygons_in(&self, cell: usize) -> &[u32] {
+    pub(crate) fn polygons_in(&self, cell: usize) -> &[u32] {
         &self.items[self.starts[cell]..self.starts[cell + 1]]
     }
 }

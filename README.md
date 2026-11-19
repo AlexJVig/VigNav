@@ -3,9 +3,9 @@
 Deterministic navigation for RTS games, in Rust: navmesh, pathfinding and
 steering that give the same result on every machine in a lockstep match.
 
-**Status: milestone 1.** Loading a navmesh, looking points up on it and finding
-paths across it work and are tested. Generation, dynamic obstacles and steering
-are on the roadmap below.
+**Status.** Loading a navmesh, looking points up on it, finding paths across
+it and laying obstacles over it at run time work and are tested. Mesh
+generation and steering are on the roadmap below.
 
 VigNav is an independent project built from published algorithms. Its feature
 set is modelled on what commercial navigation middleware such as NavPower
@@ -14,18 +14,24 @@ file formats with it.
 
 ## What it does today
 
-- `NavMesh::from_polygons` builds a mesh from convex polygons and links them
-  wherever two share an edge.
-- `NavMesh::from_linked_polygons` builds a mesh whose links are already known,
-  such as one exported from another tool.
-- `locate` finds the polygon under a point. `nearest` finds the closest point
-  of the mesh within a given distance.
-- `find_path` and `find_path_between` return the corner points of a route and
-  the polygons it crosses: A* over polygons, then the funnel algorithm.
-- `island` tells in constant time whether two polygons connect at all.
+- **Build.** `NavMesh::from_polygons` links convex polygons wherever two share
+  an edge. `NavMesh::from_linked_polygons` takes links that are already known,
+  as in a mesh exported from another tool.
+- **Look up.** `locate` finds the polygon a point is on, and `locate_all` every
+  polygon where surfaces overlap. `nearest` finds the closest point of the
+  mesh, and `nearest_reachable` the closest one a given unit can get to.
+- **Route.** `find_path` and `find_path_between` return the corner points of a
+  route and the polygons it crosses. `find_path_toward` routes as near to the
+  goal as the start can get when the goal itself is out of reach.
+- **See.** `line_of_sight` tells whether a unit can walk straight from one
+  point to another.
+- **Obstruct.** `add_obstacle` and `remove_obstacle` lay a convex shape over
+  the mesh and lift it again. `edit_obstacles` changes many at once.
+  `geom::grow_convex` grows a shape by a unit's clearance.
 
 ```rust
-use vignav::{NavMesh, Point};
+use vignav::geom::grow_convex;
+use vignav::{NavMesh, ObstacleKind, Point};
 
 // Two 10 m squares side by side, sharing the edge at x = 10 m.
 let vertices = [
@@ -36,11 +42,26 @@ let vertices = [
     Point::new(10_000, 10_000),
     Point::new(20_000, 10_000),
 ];
-let mesh = NavMesh::from_polygons(&vertices, &[[0, 1, 4, 3], [1, 2, 5, 4]])?;
+let mut mesh = NavMesh::from_polygons(&vertices, &[[0, 1, 4, 3], [1, 2, 5, 4]])?;
 
 // Endpoints up to half a metre off the mesh are moved onto it.
-let path = mesh.find_path(Point::new(1_000, 5_000), Point::new(19_000, 5_000), 500)?;
-assert_eq!(path.points, [Point::new(1_000, 5_000), Point::new(19_000, 5_000)]);
+let (start, goal) = (Point::new(1_000, 5_000), Point::new(19_000, 5_000));
+let path = mesh.find_path(start, goal, 500)?;
+assert_eq!(path.points, [start, goal]);
+
+// A building in the way, grown by the half metre these units need round them.
+let building = [
+    Point::new(9_000, 3_000),
+    Point::new(11_000, 3_000),
+    Point::new(11_000, 7_000),
+    Point::new(9_000, 7_000),
+];
+let id = mesh.add_obstacle(&grow_convex(&building, 500), ObstacleKind::Blocked)?;
+assert!(mesh.find_path(start, goal, 500)?.points.len() > 2);
+
+// Gone again, and the route is straight again.
+mesh.remove_obstacle(id);
+assert_eq!(mesh.find_path(start, goal, 500)?.points, [start, goal]);
 ```
 
 ## Feeding it a mesh you already have
@@ -59,18 +80,44 @@ A corner may dent inwards by up to 2 mm (`CONVEX_SLACK`), which absorbs the
 rounding of a mesh that was built in floating point. Anything else that is
 wrong is reported as a `MeshError` naming the polygon and the corner or edge.
 
-## Limits of this milestone
+## Obstacles
 
-- **Unit size.** Routes touch the corners of the mesh, so the mesh must already
-  be shrunk by the unit's radius.
-- **Overlapping surfaces.** Height is not stored. Where one surface passes over
-  another, `locate` returns the polygon with the lowest id; track the unit's
-  polygon and call `find_path_between` instead.
-- **Shortest paths.** The route is the shortest one through the polygons A*
-  picked. That choice is exact while the goal is in sight and a close estimate
-  otherwise, so a route is good but not provably the shortest.
-- **Memory.** Each path query allocates working memory in proportion to the
-  number of polygons.
+An obstacle is a convex shape laid over a mesh after it is built. The
+polygons of the mesh never change; lookups and routes see the ground the
+obstacles leave.
+
+- **Two kinds.** `Blocked` ground is off the mesh: a building, a wall, a rock.
+  `Avoid` ground turns other routes away, but a route that starts on it may
+  leave and a goal on it is moved to its edge: a unit standing still.
+- **Per unit class.** Lay an obstacle on the mesh of every class that cannot
+  cross it, grown by that class's clearance, and leave it off the meshes of
+  classes that crush it.
+- **Cheap to change.** Only the polygons under an obstacle are cut again, and
+  only those and their neighbours are joined up again. Change many at once
+  through `edit_obstacles`, which does that work once.
+- **The same everywhere.** Obstacle ids are handed out in order and never
+  reused, and the ground depends only on which obstacles are down, not on the
+  order they came and went in.
+
+## Limits
+
+- **Unit size.** Routes touch the corners of the mesh and of obstacles, so the
+  mesh must already be shrunk, and each obstacle grown, by the unit's radius.
+- **Height.** Nothing has a height. Where one surface passes over another,
+  `locate` returns the polygon with the lowest id: use `locate_all` and pick,
+  then route with `find_path_between`. An obstacle cuts every surface it lies
+  over.
+- **Shortest paths.** A route is straight whenever a straight walk is clear.
+  Otherwise it is the shortest one through the ground A* picked, with any
+  corner dropped that the corner before it can see past. That is good, but
+  not provably the shortest.
+- **Kinds of ground.** Ground is ordinary, avoided or blocked. There is no
+  cost per area.
+- **Line of sight.** The answer is yes or no. There is no point of impact.
+- **Meshes cut elsewhere.** Every link must run along a whole edge on both
+  sides. A mesh with obstacles already cut into it does not load; load the
+  mesh without them and lay them as obstacles.
+- **Tolerance.** A point within 2 mm of the mesh counts as on it when routing.
 
 ## Conventions
 
@@ -103,13 +150,13 @@ Rust 1.98 or newer, edition 2024; the toolchain is pinned in
 1. **Navmesh and queries.** Done, within the limits above.
 2. **Generation.** Build layers for maps that ship no mesh, from terrain,
    passability and structure footprints.
-3. **Dynamic obstacles.** Structures placed or destroyed re-cut the mesh
-   locally.
+3. **Obstacles.** Done, within the limits above.
 4. **Steering.** Path following, local avoidance and group movement.
-5. **Later.** Line-of-sight queries; heights and overlapping surfaces; reusable
-   search memory; provably shortest routes; tiles, streaming and
-   serialisation; jump and point-to-point links; generation from arbitrary 3D
-   geometry; flying and swimming volumes; debug tooling.
+5. **Later.** Where a blocked line of sight stops; heights; the walls at each
+   corner of a route; a cost per area; provably shortest routes; links along
+   part of an edge; tiles, streaming and serialisation; jump and
+   point-to-point links; generation from arbitrary 3D geometry; flying and
+   swimming volumes; debug tooling.
 
 ## Tests
 
@@ -129,6 +176,8 @@ The suite lives in `tests/suite/`, one module per flow:
 | `build` | Both ways of building a mesh, and every way they refuse bad input |
 | `lookup` | `locate`, `nearest` and `contains` |
 | `paths` | Routes with known answers, on hand-made meshes and maps drawn as text |
+| `obstacles` | Laying, lifting and routing round obstacles of both kinds |
+| `sight` | Straight-line tests, and ground that overlaps |
 | `random` | Random maps, checked against independent searches |
 | `determinism` | A recorded fingerprint of routes, which must match on every platform |
 
@@ -146,6 +195,9 @@ assert_eq!(route(&map).points, [map.at('S'), map.corner(2, 1), map.at('G')]);
 
 If a change alters any route, the fingerprint test fails and prints the new
 value. Update it only when the change is meant.
+
+For speed, `cargo run --release --example timing` prints rough timings of
+route queries and obstacle changes on a mesh the size of a large map.
 
 ## License
 
