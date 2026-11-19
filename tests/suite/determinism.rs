@@ -9,7 +9,7 @@ use super::support::*;
 ///
 /// A change to the path code that alters any route changes this too. If
 /// that is intended, replace the value with the one the failure prints.
-const RECORDED: u64 = 0x9297_a0d6_8882_acc0;
+const RECORDED: u64 = 0x27ab_09b7_55d2_3f7b;
 
 #[test]
 fn routes_match_the_recorded_fingerprint() {
@@ -31,6 +31,43 @@ fn routes_match_the_recorded_fingerprint() {
                 map.centre(rng.below(24 * 16)),
             );
             match mesh.find_path(start, goal, 1500) {
+                Ok(path) => {
+                    mix(path.points.len() as i64);
+                    path.points.iter().for_each(|point| {
+                        mix(point.x.into());
+                        mix(point.y.into());
+                    });
+                    path.corridor.iter().for_each(|poly| mix(poly.0.into()));
+                }
+                Err(error) => mix(-1 - error as i64),
+            }
+        }
+        // The same again with obstacles of both kinds scattered about.
+        let mut mesh = mesh;
+        let mut edit = mesh.edit_obstacles();
+        for k in 0..16_u32 {
+            let (x, y) = (rng.below(24_000) as i32, rng.below(16_000) as i32);
+            let reach = |rng: &mut Rng| 200 + rng.below(1800) as i32;
+            let shape = [
+                p(x - reach(&mut rng), y),
+                p(x, y - reach(&mut rng)),
+                p(x + reach(&mut rng), y),
+                p(x, y + reach(&mut rng)),
+            ];
+            let kind = if k.is_multiple_of(4) {
+                ObstacleKind::Avoid
+            } else {
+                ObstacleKind::Blocked
+            };
+            edit.add(&shape, kind).unwrap();
+        }
+        drop(edit);
+        for _ in 0..40 {
+            let (start, goal) = (
+                map.centre(rng.below(24 * 16)),
+                map.centre(rng.below(24 * 16)),
+            );
+            match mesh.find_path_toward(start, goal, 3000) {
                 Ok(path) => {
                     mix(path.points.len() as i64);
                     path.points.iter().for_each(|point| {

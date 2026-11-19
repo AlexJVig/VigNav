@@ -10,6 +10,8 @@
 mod build;
 mod determinism;
 mod lookup;
+mod obstacles;
 mod paths;
 mod random;
+mod sight;
 mod support;

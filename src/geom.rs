@@ -85,7 +85,7 @@ pub fn dist(a: Point, b: Point) -> i64 {
 }
 
 /// Where the shortest route from `from` to `to` that touches the segment
-/// `a`-`b` touches it, rounded to the nearest millimetre on each axis.
+/// `a`-`b` touches it, to within a millimetre on each axis.
 ///
 /// If the straight line between the two points crosses the segment, this is
 /// the crossing; otherwise it is the end of the segment the route bends
@@ -118,13 +118,12 @@ pub fn crossing_point(from: Point, to: Point, a: Point, b: Point) -> Point {
     if numerator >= denominator {
         return b;
     }
-    // Both can reach 2^123. Drop low bits so the product with an edge delta
-    // fits in 128; what is lost is far below a millimetre.
-    let spare = (128 - denominator.leading_zeros()).saturating_sub(94);
-    let (numerator, denominator) = (numerator >> spare, denominator >> spare);
-    let offset = |delta: i64| {
-        (2 * i128::from(delta) * numerator + denominator).div_euclid(2 * denominator) as Coord
-    };
+    // Both can reach 2^123. Keep the top 31 bits of the fraction: that
+    // places the point to within a thousandth of a millimetre on an edge a
+    // kilometre long, and leaves a division the machine can do in one step.
+    let spare = (128 - denominator.leading_zeros()).saturating_sub(31);
+    let (part, whole) = ((numerator >> spare) as i64, (denominator >> spare) as i64);
+    let offset = |delta: i64| (2 * delta * part + whole).div_euclid(2 * whole) as Coord;
     Point::new(a.x + offset(abx), a.y + offset(aby))
 }
 
@@ -151,6 +150,97 @@ pub fn closest_on_segment(p: Point, a: Point, b: Point) -> Point {
         (2 * scaled + i128::from(len_sq)).div_euclid(2 * i128::from(len_sq)) as Coord
     };
     Point::new(a.x + offset(abx), a.y + offset(aby))
+}
+
+/// The dot product of the vectors from `origin` to `a` and from `origin` to
+/// `b`. Exact for in-range points.
+pub fn dot(origin: Point, a: Point, b: Point) -> i64 {
+    (i64::from(a.x) - i64::from(origin.x)) * (i64::from(b.x) - i64::from(origin.x))
+        + (i64::from(a.y) - i64::from(origin.y)) * (i64::from(b.y) - i64::from(origin.y))
+}
+
+/// Where the segment `from`-`to` crosses a line, rounded to the nearest
+/// millimetre. `side_from` and `side_to` are [`cross`] of the line with each
+/// end, and must have opposite signs.
+pub(crate) fn split_point(from: Point, to: Point, side_from: i64, side_to: i64) -> Point {
+    // from + (to - from) * side_from / (side_from - side_to), a fraction
+    // strictly between nought and one.
+    let (part, whole) = (
+        i128::from(side_from),
+        i128::from(side_from) - i128::from(side_to),
+    );
+    let (part, whole) = if whole < 0 {
+        (-part, -whole)
+    } else {
+        (part, whole)
+    };
+    let offset = |delta: i64| (2 * i128::from(delta) * part + whole).div_euclid(2 * whole) as Coord;
+    Point::new(
+        from.x + offset(i64::from(to.x) - i64::from(from.x)),
+        from.y + offset(i64::from(to.y) - i64::from(from.y)),
+    )
+}
+
+/// The convex hull of a set of points, counter-clockwise, starting from the
+/// leftmost point (the lowest of them on a tie). Points on the straight
+/// between two hull corners are left out.
+pub fn convex_hull(points: &[Point]) -> Vec<Point> {
+    let mut sorted = points.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.len() < 3 {
+        return sorted;
+    }
+    let mut hull: Vec<Point> = Vec::with_capacity(sorted.len() + 1);
+    // The lower side left to right, then the upper side back again.
+    for &p in &sorted {
+        while hull.len() >= 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0 {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+    let lower = hull.len() + 1;
+    for &p in sorted.iter().rev().skip(1) {
+        while hull.len() >= lower && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0 {
+            hull.pop();
+        }
+        hull.push(p);
+    }
+    hull.pop();
+    hull
+}
+
+/// A shape grown outwards by `by` millimetres on every side: the ground a
+/// unit of that radius cannot put its centre on without touching the shape.
+///
+/// The result is the convex hull of the corners, each with an octagon drawn
+/// round it. The octagon's flat sides are `by` away, so nothing nearer than
+/// `by` is left out, and its corners are about 8% further.
+pub fn grow_convex(corners: &[Point], by: Coord) -> Vec<Point> {
+    let by = i64::from(by.max(0));
+    // by * tan(22.5 degrees), rounded up.
+    let k = (by * 41_422 + 99_999) / 100_000;
+    let ring = [
+        (by, k),
+        (k, by),
+        (-k, by),
+        (-by, k),
+        (-by, -k),
+        (-k, -by),
+        (k, -by),
+        (by, -k),
+    ];
+    // Kept well inside `i32`, so that the hull's cross products cannot overflow.
+    let limit = (1_i64 << 30) - 1;
+    let moved = |c: Coord, by: i64| (i64::from(c) + by).clamp(-limit, limit) as Coord;
+    let grown: Vec<Point> = corners
+        .iter()
+        .flat_map(|c| {
+            ring.iter()
+                .map(move |&(dx, dy)| Point::new(moved(c.x, dx), moved(c.y, dy)))
+        })
+        .collect();
+    convex_hull(&grown)
 }
 
 #[cfg(test)]
@@ -271,5 +361,62 @@ mod tests {
         assert_eq!(cross(a, b, c), 1_i64 << 60);
         assert!(!Point::new(l + 1, 0).in_range());
         assert!(!Point::new(0, i32::MIN).in_range());
+    }
+
+    #[test]
+    fn split_point_is_shared_by_both_sides() {
+        // The line y = 1000 cuts the edge a third of the way up.
+        let (low, high) = (Point::new(0, 0), Point::new(300, 3000));
+        let line = (Point::new(-5, 1000), Point::new(5, 1000));
+        let (below, above) = (cross(line.0, line.1, low), cross(line.0, line.1, high));
+        assert!(below < 0 && above > 0);
+        assert_eq!(split_point(low, high, below, above), Point::new(100, 1000));
+        assert_eq!(split_point(high, low, above, below), Point::new(100, 1000));
+    }
+
+    #[test]
+    fn hull_is_counter_clockwise_without_points_on_its_sides() {
+        let points = [
+            Point::new(2, 2),
+            Point::new(0, 0),
+            Point::new(4, 0),
+            Point::new(2, 0),
+            Point::new(4, 4),
+            Point::new(0, 4),
+            Point::new(2, 2),
+        ];
+        let square = [
+            Point::new(0, 0),
+            Point::new(4, 0),
+            Point::new(4, 4),
+            Point::new(0, 4),
+        ];
+        assert_eq!(convex_hull(&points), square);
+        assert_eq!(
+            convex_hull(&points[..2]),
+            [Point::new(0, 0), Point::new(2, 2)]
+        );
+    }
+
+    #[test]
+    fn growing_keeps_every_point_within_reach_and_little_more() {
+        let square = [
+            Point::new(0, 0),
+            Point::new(4000, 0),
+            Point::new(4000, 4000),
+            Point::new(0, 4000),
+        ];
+        let grown = grow_convex(&square, 1000);
+        // The octagon's sides along the square's merge with them.
+        assert_eq!(grown.len(), 8);
+        let inside = |p: Point| {
+            (0..grown.len()).all(|i| cross(grown[i], grown[(i + 1) % grown.len()], p) >= 0)
+        };
+        // A metre out from a side and from a corner.
+        assert!(inside(Point::new(2000, -1000)) && inside(Point::new(5000, 2000)));
+        assert!(inside(Point::new(-707, -707)) && inside(Point::new(4707, 4707)));
+        // But not much more than a metre.
+        assert!(!inside(Point::new(2000, -1001)) && !inside(Point::new(-800, -800)));
+        assert_eq!(grow_convex(&square, 0), square);
     }
 }

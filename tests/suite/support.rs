@@ -4,8 +4,10 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-pub use vignav::geom::{COORD_LIMIT, dist};
-pub use vignav::{Location, MeshError, NavMesh, Path, PathError, Point, PolyId};
+pub use vignav::geom::{COORD_LIMIT, convex_hull, cross, dist, dist_sq, grow_convex};
+pub use vignav::{
+    Location, MeshError, NavMesh, ObstacleId, ObstacleKind, Path, PathError, Point, PolyId,
+};
 
 /// One metre.
 pub const M: i32 = 1000;
@@ -37,6 +39,44 @@ pub fn l_shape() -> NavMesh {
 
 pub fn links(mesh: &NavMesh, poly: PolyId) -> Vec<Option<PolyId>> {
     mesh.neighbors(poly).collect()
+}
+
+/// A 20 m square of open ground as a single polygon.
+pub fn field() -> NavMesh {
+    let corners = [p(0, 0), p(20 * M, 0), p(20 * M, 20 * M), p(0, 20 * M)];
+    NavMesh::from_polygons(&corners, &[[0, 1, 2, 3]]).unwrap()
+}
+
+/// An axis-aligned rectangle, counter-clockwise, from metres.
+pub fn rect(x0: i32, y0: i32, x1: i32, y1: i32) -> [Point; 4] {
+    [
+        p(x0 * M, y0 * M),
+        p(x1 * M, y0 * M),
+        p(x1 * M, y1 * M),
+        p(x0 * M, y1 * M),
+    ]
+}
+
+/// Whether `q` is more than 2 mm inside a convex shape: further in than
+/// rounding can account for.
+pub fn deep_inside(shape: &[Point], q: Point) -> bool {
+    (0..shape.len()).all(|i| {
+        let (a, b) = (shape[i], shape[(i + 1) % shape.len()]);
+        cross(a, b, q) as f64 > 2.0 * (dist_sq(a, b) as f64).sqrt()
+    })
+}
+
+/// The points of a route every 50 mm along it.
+pub fn samples(path: &Path) -> Vec<Point> {
+    let mut points = Vec::new();
+    for leg in path.points.windows(2) {
+        let steps = (dist(leg[0], leg[1]) / 50).max(1);
+        for k in 0..=steps {
+            let along = |a: i32, b: i32| a + (i64::from(b - a) * k / steps) as i32;
+            points.push(p(along(leg[0].x, leg[1].x), along(leg[0].y, leg[1].y)));
+        }
+    }
+    points
 }
 
 /// A small fixed-seed generator, so the random maps are the same every run.
@@ -147,6 +187,32 @@ impl Map {
             self.origin.x + (cell % self.width) as i32 * M + 500,
             self.origin.y + (cell / self.width) as i32 * M + 500,
         )
+    }
+
+    /// The four corners of a cell, counter-clockwise.
+    pub fn cell_corners(&self, cell: usize) -> [Point; 4] {
+        let (x, y) = ((cell % self.width) as i32, (cell / self.width) as i32);
+        [
+            self.corner(x, y),
+            self.corner(x + 1, y),
+            self.corner(x + 1, y + 1),
+            self.corner(x, y + 1),
+        ]
+    }
+
+    /// The same ground built the other way: a mesh of the whole map with an
+    /// obstacle laid over every blocked cell.
+    pub fn mesh_with_obstacles(&self) -> NavMesh {
+        let mut mesh = Map::open(self.width, self.height)
+            .moved_to(self.origin)
+            .navmesh();
+        let mut edit = mesh.edit_obstacles();
+        for cell in (0..self.blocked.len()).filter(|&cell| self.blocked[cell]) {
+            edit.add(&self.cell_corners(cell), ObstacleKind::Blocked)
+                .unwrap();
+        }
+        drop(edit);
+        mesh
     }
 
     /// The mesh alone, for tests that do not need to know which polygon a
@@ -268,8 +334,23 @@ impl Map {
     }
 }
 
-/// Checks everything a route must satisfy whatever the map.
+/// Checks everything a route must satisfy on a mesh with no obstacles: all
+/// of [`check_route`], and that every turn is at a corner of a polygon the
+/// route crosses.
 pub fn check_path(mesh: &NavMesh, path: &Path, start: Point, goal: Point) {
+    check_route(mesh, path, start, goal);
+    let turns = path.points.len().saturating_sub(2);
+    for turn in path.points.iter().skip(1).take(turns) {
+        let at_a_corner = |&poly: &PolyId| mesh.corners(poly).any(|corner| corner == *turn);
+        assert!(
+            path.corridor.iter().any(at_a_corner),
+            "turn at {turn:?} is not a corner"
+        );
+    }
+}
+
+/// Checks everything a route must satisfy whatever is on the mesh.
+pub fn check_route(mesh: &NavMesh, path: &Path, start: Point, goal: Point) {
     assert_eq!(path.points.first(), Some(&start));
     assert_eq!(path.points.last(), Some(&goal));
     assert!(path.points.windows(2).all(|leg| leg[0] != leg[1]));
@@ -279,15 +360,6 @@ pub fn check_path(mesh: &NavMesh, path: &Path, start: Point, goal: Point) {
         assert!(
             mesh.neighbors(step[0]).any(|n| n == Some(step[1])),
             "corridor breaks at {step:?}"
-        );
-    }
-    // Every turn is at a corner of a polygon the route crosses.
-    let turns = path.points.len().saturating_sub(2);
-    for turn in path.points.iter().skip(1).take(turns) {
-        let at_a_corner = |&poly: &PolyId| mesh.corners(poly).any(|corner| corner == *turn);
-        assert!(
-            path.corridor.iter().any(at_a_corner),
-            "turn at {turn:?} is not a corner"
         );
     }
     // The route stays on the mesh. Samples are rounded to the millimetre,
