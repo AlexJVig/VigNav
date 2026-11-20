@@ -3,9 +3,9 @@
 Deterministic navigation for RTS games, in Rust: navmesh, pathfinding and
 steering that give the same result on every machine in a lockstep match.
 
-**Status.** Loading a navmesh, looking points up on it, finding paths across
-it and laying obstacles over it at run time work and are tested. Mesh
-generation and steering are on the roadmap below.
+**Status.** Loading a navmesh or generating one from terrain, looking points
+up on it, finding paths across it and laying obstacles over it at run time
+work and are tested. Steering is on the roadmap below.
 
 VigNav is an independent project built from published algorithms. Its feature
 set is modelled on what commercial navigation middleware such as NavPower
@@ -17,6 +17,8 @@ file formats with it.
 - **Build.** `NavMesh::from_polygons` links convex polygons wherever two share
   an edge. `NavMesh::from_linked_polygons` takes links that are already known,
   as in a mesh exported from another tool.
+- **Generate.** `Terrain::generate` builds a mesh from a grid of passable and
+  blocked cells, keeping a unit's radius clear of blocked ground.
 - **Look up.** `locate` finds the polygon a point is on, and `locate_all` every
   polygon where surfaces overlap. `nearest` finds the closest point of the
   mesh, and `nearest_reachable` the closest one a given unit can get to.
@@ -80,6 +82,36 @@ A corner may dent inwards by up to 2 mm (`CONVEX_SLACK`), which absorbs the
 rounding of a mesh that was built in floating point. Anything else that is
 wrong is reported as a `MeshError` naming the polygon and the corner or edge.
 
+## Generating a mesh
+
+Where a map has no mesh of its own, build one from a grid of square cells:
+
+```rust
+use vignav::{Layer, Point, Terrain};
+
+// A 30 m by 20 m map of 1 m cells with a rock in the middle.
+let mut terrain = Terrain::new(Point::new(0, 0), 1_000, 30, 20)?;
+terrain.set_blocked(15, 10, true);
+
+// Ground for units that need half a metre round them.
+let mesh = terrain.generate(&Layer::new(500, 250))?;
+assert!(mesh.locate(Point::new(15_500, 10_500)).is_none());
+```
+
+- **Cells.** Block them one at a time with `set_blocked`, by steepness from
+  corner heights with `block_steep`, or under a building's footprint with
+  `block_shape`. Things that come and go during a match are better laid as
+  obstacles afterwards.
+- **One mesh per unit class.** A `Layer` gives the class's radius. The radius
+  is always kept clear of blocked cells and of the edge of the map. Corners
+  are cut at 45 degrees, and the radius is rounded up to the lattice, so
+  ground is only ever left out if it is nearer than
+  `1.09 x radius + 2 x resolution` to something.
+- **Resolution.** The lattice spacing must divide the cell size. Half the
+  radius or finer keeps the rounding small; finer than that only costs time.
+- **Pockets.** `Layer::min_island` leaves out patches of ground too small to
+  matter that are cut off from everything else.
+
 ## Obstacles
 
 An obstacle is a convex shape laid over a mesh after it is built. The
@@ -114,6 +146,10 @@ obstacles leave.
 - **Kinds of ground.** Ground is ordinary, avoided or blocked. There is no
   cost per area.
 - **Line of sight.** The answer is yes or no. There is no point of impact.
+- **Generation.** The input is a grid of square cells; blocked ground follows
+  cell edges, and heights are used only to tell steep cells. Polygons are
+  stacked from horizontal runs, so ground beside a ragged edge comes out as
+  long thin strips.
 - **Meshes cut elsewhere.** Every link must run along a whole edge on both
   sides. A mesh with obstacles already cut into it does not load; load the
   mesh without them and lay them as obstacles.
@@ -148,8 +184,7 @@ Rust 1.98 or newer, edition 2024; the toolchain is pinned in
 ## Roadmap
 
 1. **Navmesh and queries.** Done, within the limits above.
-2. **Generation.** Build layers for maps that ship no mesh, from terrain,
-   passability and structure footprints.
+2. **Generation.** Done for grids of cells, within the limits above.
 3. **Obstacles.** Done, within the limits above.
 4. **Steering.** Path following, local avoidance and group movement.
 5. **Later.** Where a blocked line of sight stops; heights; the walls at each
@@ -174,12 +209,13 @@ The suite lives in `tests/suite/`, one module per flow:
 | Module | What it covers |
 |---|---|
 | `build` | Both ways of building a mesh, and every way they refuse bad input |
+| `generation` | Meshes built from terrain: clearance, cut corners, gaps, steep ground, footprints, pockets |
 | `lookup` | `locate`, `nearest` and `contains` |
 | `paths` | Routes with known answers, on hand-made meshes and maps drawn as text |
 | `obstacles` | Laying, lifting and routing round obstacles of both kinds |
 | `sight` | Straight-line tests, and ground that overlaps |
 | `random` | Random maps, checked against independent searches |
-| `determinism` | A recorded fingerprint of routes, which must match on every platform |
+| `determinism` | Recorded fingerprints of routes and of generated meshes, which must match on every platform |
 
 To cover something new, add a test to the module it belongs to. A scenario is
 usually a small map drawn as text:
@@ -193,11 +229,12 @@ let map = Map::drawn(&[
 assert_eq!(route(&map).points, [map.at('S'), map.corner(2, 1), map.at('G')]);
 ```
 
-If a change alters any route, the fingerprint test fails and prints the new
-value. Update it only when the change is meant.
+If a change alters any route or any generated mesh, a fingerprint test fails
+and prints the new value. Update it only when the change is meant.
 
 For speed, `cargo run --release --example timing` prints rough timings of
-route queries and obstacle changes on a mesh the size of a large map.
+route queries, obstacle changes and generation on a map the size of a large
+one.
 
 ## License
 

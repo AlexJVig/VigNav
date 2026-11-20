@@ -9,6 +9,7 @@
 
 mod build;
 mod determinism;
+mod generation;
 mod lookup;
 mod obstacles;
 mod paths;

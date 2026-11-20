@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use vignav::{NavMesh, ObstacleKind, Point};
+use vignav::{Layer, NavMesh, ObstacleKind, Point, Terrain};
 
 const COLS: usize = 64;
 const ROWS: usize = 52;
@@ -144,4 +144,39 @@ fn main() {
 
     time("far routes  among obstacles", &mesh, &far);
     time("near routes among obstacles", &mesh, &near);
+
+    // Generation: a 900 m square map of 3 m cells with rocky patches on it,
+    // for units that need 2 m round them.
+    let mut terrain = Terrain::new(Point::new(0, 0), 3000, 300, 300).unwrap();
+    for _ in 0..700 {
+        let (x0, y0) = (rng.below(300), rng.below(300));
+        let (wide, high) = (1 + rng.below(6), 1 + rng.below(6));
+        for y in y0..(y0 + high).min(300) {
+            for x in x0..(x0 + wide).min(300) {
+                terrain.set_blocked(x, y, true);
+            }
+        }
+    }
+    for (radius, resolution) in [(0, 3000), (2000, 500), (2000, 250)] {
+        let began = Instant::now();
+        let ground = terrain.generate(&Layer::new(radius, resolution)).unwrap();
+        println!(
+            "300 x 300 cells, {radius} mm radius on a {resolution} mm lattice: {} polygons in {:.1} ms",
+            ground.polygon_count(),
+            began.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    let ground = terrain.generate(&Layer::new(2000, 500)).unwrap();
+    let across = |rng: &mut Rng| Point::new(rng.below(900_000) as i32, rng.below(900_000) as i32);
+    let far: Vec<(Point, Point)> = (0..4000)
+        .map(|_| (across(&mut rng), across(&mut rng)))
+        .collect();
+    let near: Vec<(Point, Point)> = (0..4000)
+        .map(|_| {
+            let from = across(&mut rng);
+            (from, nearby(&mut rng, from))
+        })
+        .collect();
+    time("far routes  on generated ground", &ground, &far);
+    time("near routes on generated ground", &ground, &near);
 }

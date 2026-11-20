@@ -45,13 +45,18 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
+//! Where a map has no mesh of its own, [`Terrain::generate`] builds one from a
+//! grid of passable and blocked cells.
+//!
 //! The README carries the limits and the roadmap.
 
+pub mod generate;
 pub mod geom;
 pub mod live;
 pub mod mesh;
 pub mod path;
 
+pub use generate::{GenerateError, Layer, Terrain};
 pub use geom::{Coord, Point};
 pub use live::{ObstacleEdit, ObstacleId, ObstacleKind};
 pub use mesh::{Location, MeshError, NavMesh, PolyId};

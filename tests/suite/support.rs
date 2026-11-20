@@ -6,7 +6,8 @@ use std::collections::BinaryHeap;
 
 pub use vignav::geom::{COORD_LIMIT, convex_hull, cross, dist, dist_sq, grow_convex};
 pub use vignav::{
-    Location, MeshError, NavMesh, ObstacleId, ObstacleKind, Path, PathError, Point, PolyId,
+    GenerateError, Layer, Location, MeshError, NavMesh, ObstacleId, ObstacleKind, Path, PathError,
+    Point, PolyId, Terrain,
 };
 
 /// One metre.
@@ -187,6 +188,15 @@ impl Map {
             self.origin.x + (cell % self.width) as i32 * M + 500,
             self.origin.y + (cell / self.width) as i32 * M + 500,
         )
+    }
+
+    /// The same map as terrain to generate a mesh from.
+    pub fn terrain(&self) -> Terrain {
+        let mut terrain = Terrain::new(self.origin, M, self.width, self.height).unwrap();
+        for cell in (0..self.blocked.len()).filter(|&cell| self.blocked[cell]) {
+            terrain.set_blocked(cell % self.width, cell / self.width, true);
+        }
+        terrain
     }
 
     /// The four corners of a cell, counter-clockwise.
