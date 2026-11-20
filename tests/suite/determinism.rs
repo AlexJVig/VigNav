@@ -125,3 +125,42 @@ fn asking_twice_gives_the_same_route() {
         assert_eq!(again.find_path(start, goal, 1500), first);
     }
 }
+
+/// The fingerprint of the meshes generated below: every corner and every
+/// link of every polygon. Like `RECORDED`, it must come out the same on
+/// every platform, and changes only when the generator is meant to.
+const RECORDED_GROUND: u64 = 0xdd1d_5240_27d0_ca50;
+
+#[test]
+fn generated_meshes_match_the_recorded_fingerprint() {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |value: i64| {
+        for byte in value.to_le_bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for seed in 1..=4_u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let terrain = Map::random(&mut rng, 24, 16, 22).terrain();
+        for layer in [
+            Layer::new(0, M),
+            Layer::new(700, 250),
+            Layer::new(1500, 500),
+        ] {
+            let mesh = terrain.generate(&layer).unwrap();
+            mix(mesh.polygon_count() as i64);
+            for polygon in 0..mesh.polygon_count() as u32 {
+                mesh.corners(PolyId(polygon)).for_each(|q| {
+                    mix(q.x.into());
+                    mix(q.y.into());
+                });
+                mesh.neighbors(PolyId(polygon))
+                    .for_each(|link| mix(link.map_or(-1, |id| id.0.into())));
+            }
+        }
+    }
+    assert_eq!(
+        hash, RECORDED_GROUND,
+        "generated meshes changed; if that is intended, set RECORDED_GROUND to {hash:#018x}"
+    );
+}
